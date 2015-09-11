@@ -28,6 +28,7 @@ from mininet.log import info, error, debug
 from mininet.util import makeIntfPair
 import mininet.node
 import re
+import itertools
 
 class Intf( object ):
 
@@ -217,6 +218,98 @@ class Intf( object ):
         return self.name
 
 
+class TCHandle( object ):
+    def __init__( self, handle ):
+        self.handle = handle
+        self.children = []
+
+    def getCommands( self, *args, **kwargs):
+        return []
+
+    def addChild( self, child ):
+        self.children.append(child)
+        return child
+
+    def childQdisc( self, *args,  **kwargs ):
+        return self.addChild(TCQdisc(*args, parent=self.handle, **kwargs))
+
+    def childClass( self, *args, **kwargs ):
+        return self.addChild(TCClass(*args, parent=self.handle, **kwargs))
+
+class TCRoot( TCHandle ):
+    def __init__( self ):
+        TCHandle.__init__(self, 'root')
+
+    def isChangeableTo( self, other ):
+        return isinstance(other, TCRoot)
+
+    def needsChange( self, other ):
+        assert self.isChangeableTo( other )
+        return False
+
+    def __repr__(self):
+        return "TCRoot(children=%s)" % repr(self.children)
+
+class TCQdisc( TCHandle ):
+    def __init__( self, parent, qdisc, args, **params):
+        TCHandle.__init__(self, **params)
+        self.parent = parent
+        self.qdisc = qdisc
+        self.args = args
+
+    def getCommands( self, tc, op, dev ):
+        return ["{tc} qdisc {op} dev {dev} parent {parent} handle {handle} {qdisc} {args}".format(
+            tc=tc, op=op, dev=dev, parent=self.parent,
+            handle=self.handle, qdisc=self.qdisc, args=self.args
+        )]
+
+    def isChangeableTo( self, other ):
+        if not isinstance(other, TCQdisc ):
+            return False
+        return (
+            self.parent == other.parent and
+            self.handle == other.handle and
+            self.qdisc == other.qdisc
+        )
+
+    def needsChange( self, other ):
+        assert self.isChangeableTo( other )
+        return self.args != other.args
+
+    def __repr__(self):
+        return "TCQdisc(parent=%s, handle=%s, qdisc=%s, args=%s, children=%s)" % (
+                repr(self.parent), repr(self.handle), repr(self.qdisc), repr(self.args), repr(self.children)
+        )
+
+class TCClass( TCHandle ):
+    def __init__( self, parent, args, **params):
+        TCHandle.__init__(self, **params)
+        self.parent = parent
+        self.args = args
+
+    def getCommands( self, tc, op, dev ):
+        return ["{tc} class {op} dev {dev} parent {parent} classid {handle} {args}".format(
+            tc=tc, op=op, dev=dev, parent=self.parent, handle=self.handle,
+            args=self.args
+        )]
+    
+    def isChangeableTo( self, other ):
+        if not isinstance(other, TCClass ):
+            return False
+        return (
+            self.parent == other.parent and
+            self.handle == other.handle
+        )
+
+    def needsChange( self, other ):
+        assert self.isChangeableTo( other )
+        return self.args != other.args
+    
+    def __repr__(self):
+        return "TCClass(parent=%s, handle=%s, args=%s, children=%s)" % (
+            repr(self.parent), repr(self.handle), repr(self.args), repr(self.children)
+        )
+
 class TCIntf( Intf ):
     """Interface customized by tc (traffic control) utility
        Allows specification of bandwidth limits (various methods)
@@ -226,88 +319,130 @@ class TCIntf( Intf ):
     # For higher data rates, we will probably need to change them.
     bwParamMax = 1000
 
-    def bwCmds( self, bw=None, speedup=0, use_hfsc=False, use_tbf=False,
-                latency_ms=None, enable_ecn=False, enable_red=False ):
-        "Return tc commands to set bandwidth"
+    def __init__(self, *args, **kwargs):
+        self.current_tc_root = None
+        super(TCIntf, self).__init__(*args, **kwargs)
 
-        cmds, parent = [], ' root '
+    @classmethod
+    def limitBandwidth( cls, tc_node, bw=None, speedup=0, use_hfsc=False, use_tbf=False,
+                latency_ms=None ):
+        "Construct TC commands hierarchy for limiting bandwidth"
 
-        if bw and ( bw < 0 or bw > self.bwParamMax ):
+        if not bw:
+            return tc_node
+
+        if bw < 0 or bw > cls.bwParamMax:
             error( 'Bandwidth limit', bw, 'is outside supported range 0..%d'
                    % self.bwParamMax, '- ignoring\n' )
-        elif bw is not None:
-            # BL: this seems a bit brittle...
-            if ( speedup > 0 and
-                 self.node.name[0:1] == 's' ):
-                bw = speedup
-            # This may not be correct - we should look more closely
-            # at the semantics of burst (and cburst) to make sure we
-            # are specifying the correct sizes. For now I have used
-            # the same settings we had in the mininet-hifi code.
-            if use_hfsc:
-                cmds += [ '%s qdisc add dev %s root handle 5:0 hfsc default 1',
-                          '%s class add dev %s parent 5:0 classid 5:1 hfsc sc '
-                          + 'rate %fMbit ul rate %fMbit' % ( bw, bw ) ]
-            elif use_tbf:
-                if latency_ms is None:
-                    latency_ms = 15 * 8 / bw
-                cmds += [ '%s qdisc add dev %s root handle 5: tbf ' +
-                          'rate %fMbit burst 15000 latency %fms' %
-                          ( bw, latency_ms ) ]
-            else:
-                cmds += [ '%s qdisc add dev %s root handle 5:0 htb default 1',
-                          '%s class add dev %s parent 5:0 classid 5:1 htb ' +
-                          'rate %fMbit burst 15k' % bw ]
-            parent = ' parent 5:1 '
+            return tc_node
 
-            # ECN or RED
-            if enable_ecn:
-                cmds += [ '%s qdisc add dev %s' + parent +
-                          'handle 6: red limit 1000000 ' +
-                          'min 30000 max 35000 avpkt 1500 ' +
-                          'burst 20 ' +
-                          'bandwidth %fmbit probability 1 ecn' % bw ]
-                parent = ' parent 6: '
-            elif enable_red:
-                cmds += [ '%s qdisc add dev %s' + parent +
-                          'handle 6: red limit 1000000 ' +
-                          'min 30000 max 35000 avpkt 1500 ' +
-                          'burst 20 ' +
-                          'bandwidth %fmbit probability 1' % bw ]
-                parent = ' parent 6: '
-        return cmds, parent
+        # FIXME: speedup arg needs some documentation and explanation
+        # BL: this seems a bit brittle...
+        if ( speedup > 0 and
+             self.node.name[0:1] == 's' ):
+            bw = speedup
+
+        # This may not be correct - we should look more closely
+        # at the semantics of burst (and cburst) to make sure we
+        # are specifying the correct sizes. For now I have used
+        # the same settings we had in the mininet-hifi code.
+        if use_hfsc:
+            tc_node = tc_node.childQdisc(
+                            handle='5:', qdisc='hfsc', args='default 1'
+                        )
+            tc_node = tc_node.childClass(
+                                handle='5:1',
+                                args='hfsc sc rate %fMbit ul rate %fMbit' % ( bw, bw )
+                            )
+        elif use_tbf:
+            # latency is the longest time packet can sit in TBF
+            if latency_ms is None:
+                # PP: what is this magic computation?
+                # PP: is this correct if bw is integer?
+                latency_ms = 15 * 8 / bw
+            tc_node = tc_node.childQdisc(
+                            handle='5:', qdisc='tbf', 
+                            args='rate %fMbit burst 15000 latency %fms' % ( bw, latency_ms )
+                        )
+        else:
+            tc_node = tc_node.childQdisc(
+                            handle='5:', qdisc='htb', args='default 1'
+                        )
+            tc_node = tc_node.childClass(
+                            handle='5:1', 
+                            args='htb rate %fMbit burst 15k' % bw
+                        )
+        return tc_node
 
     @staticmethod
-    def delayCmds( parent, delay=None, jitter=None,
+    def addQueueManagement( tc_node, bw=None, enable_ecn=False, enable_red=False ):
+        # ECN or RED
+        if enable_ecn or enable_red:
+            tc_node = tc_node.childQdisc(
+                            handle='6:',
+                            qdisc='red',
+                            args='limit 1000000 ' +
+                                'min 30000 max 35000 avpkt 1500 ' +
+                                'burst 20 ' +
+                                'bandwidth %fmbit probability 1' % bw +
+                                (' ecn' if enable_ecn else '')
+                        )
+        return tc_node
+
+    @staticmethod
+    def addDelay( tc_node, delay=None, jitter=None,
                    loss=None, max_queue_size=None ):
-        "Internal method: return tc commands for delay and loss"
-        cmds = []
         if delay and delay < 0:
             error( 'Negative delay', delay, '\n' )
-        elif jitter and jitter < 0:
+            return tc_node
+        
+        if jitter and jitter < 0:
             error( 'Negative jitter', jitter, '\n' )
-        elif loss and ( loss < 0 or loss > 100 ):
-            error( 'Bad loss percentage', loss, '%%\n' )
-        else:
-            # Delay/jitter/loss/max queue size
-            netemargs = '%s%s%s%s' % (
-                'delay %s ' % delay if delay is not None else '',
-                '%s ' % jitter if jitter is not None else '',
-                'loss %d ' % loss if loss is not None else '',
-                'limit %d' % max_queue_size if max_queue_size is not None
-                else '' )
-            if netemargs:
-                cmds = [ '%s qdisc add dev %s ' + parent +
-                         ' handle 10: netem ' +
-                         netemargs ]
-                parent = ' parent 10:1 '
-        return cmds, parent
+            return tc_node
 
-    def tc( self, cmd, tc='tc' ):
-        "Execute tc command for our interface"
-        c = cmd % (tc, self)  # Add in tc command and our name
-        debug(" *** executing command: %s\n" % c)
-        return self.cmd( c )
+        if jitter and jitter > delay:
+            error( 'Jitter', jitter, ' bigger than delay', delay, '\n' )
+            return tc_node
+
+        if loss and ( loss < 0 or loss > 100 ):
+            error( 'Bad loss percentage', loss, '%%\n' )
+            return tc_node
+
+        # Delay/jitter/loss/max queue size
+        netemargs = []
+        if delay:
+            netemargs.append( 'delay %sms' % delay )
+        if jitter:
+            netemargs.append( jitter )
+        if loss:
+            netemargs.append( 'loss %d' % loss )
+        if max_queue_size:
+            netemargs.append( 'limit %d' % max_queue_size )
+
+        if netemargs:
+            return tc_node.childQdisc( handle="10:", qdisc="netem", args=" ".join(netemargs) )
+        else:
+            return tc_node
+
+    def getReconciliationSequence(self, old_node, new_node):
+        debug("Reconciliate", old_node, " vs ", new_node, "\n")
+        if old_node and new_node and old_node.isChangeableTo(new_node):
+            if new_node.needsChange(old_node):
+                yield ("change", new_node)
+            for old, new in itertools.izip_longest(old_node.children, new_node.children):
+                for tmp in self.getReconciliationSequence(old, new):
+                    yield tmp
+        else:
+            # Okay, no change
+            if old_node:
+                yield ("remove", old_node)
+                # Note: children are deleted automatically
+            if new_node:
+                yield ("add", new_node)
+                for child in new_node.children:
+                    for tmp in self.getReconciliationSequence(None, child):
+                        yield tmp
+
 
     def config( self, bw=None, delay=None, jitter=None, loss=None,
                 disable_gro=True, speedup=0, use_hfsc=False, use_tbf=False,
@@ -320,56 +455,65 @@ class TCIntf( Intf ):
         # Disable GRO
         if disable_gro:
             self.cmd( 'ethtool -K %s gro off' % self )
+        self.reconfig( bw=bw, delay=delay, jitter=jitter, loss=loss,
+                       disable_gro=disable_gro, speedup=speedup, use_hfsc=use_hfsc,
+                    use_tbf=use_tbf, latency_ms=latency_ms, enable_ecn=enable_ecn,
+                    enable_red=enable_red)
 
-        # Optimization: return if nothing else to configure
-        # Question: what happens if we want to reset things?
-        if ( bw is None and not delay and not loss
-             and max_queue_size is None ):
-            return
+    def reconfig( self, bw=None, delay=None, jitter=None, loss=None,
+                disable_gro=True, speedup=0, use_hfsc=False, use_tbf=False,
+                latency_ms=None, enable_ecn=False, enable_red=False,
+                max_queue_size=None, **params ):
+        debug(str(locals()))
+        tc_root = TCRoot()
+        tc_node = tc_root
 
-        # Clear existing configuration
-        tcoutput = self.tc( '%s qdisc show dev %s' )
-        if "priomap" not in tcoutput:
-            cmds = [ '%s qdisc del dev %s root' ]
-        else:
-            cmds = []
+        tc_node = self.limitBandwidth( tc_node, bw=bw, speedup=speedup,
+                                       use_hfsc=use_hfsc, use_tbf=use_tbf,
+                                       latency_ms=latency_ms )
+        tc_node = self.addQueueManagement( tc_node, bw=bw,
+                                           enable_ecn=enable_ecn,
+                                           enable_red=enable_red )
+        tc_node = self.addDelay( tc_node, delay=delay, jitter=jitter,
+                                 loss=loss, max_queue_size=max_queue_size )
 
-        # Bandwidth limits via various methods
-        bwcmds, parent = self.bwCmds( bw=bw, speedup=speedup,
-                                      use_hfsc=use_hfsc, use_tbf=use_tbf,
-                                      latency_ms=latency_ms,
-                                      enable_ecn=enable_ecn,
-                                      enable_red=enable_red )
-        cmds += bwcmds
+        tcoutputs = []
+        if not self.current_tc_root:
+            # Clear existing configuration
+            tcoutputs.append(self.cmd('tc qdisc del dev %s root' % self.name))
 
-        # Delay/jitter/loss/max_queue_size using netem
-        delaycmds, parent = self.delayCmds( delay=delay, jitter=jitter,
-                                            loss=loss,
-                                            max_queue_size=max_queue_size,
-                                            parent=parent )
-        cmds += delaycmds
+        for op, node in self.getReconciliationSequence(self.current_tc_root, tc_root):
+            cmds = node.getCommands( tc='tc', op=op, dev=self.name )
+            for cmd in cmds:
+                debug(" *** executing command: %s\n" % cmd)
+                tcoutputs.append(self.cmd(cmd))
 
-        # Ugly but functional: display configuration info
-        stuff = ( ( [ '%.2fMbit' % bw ] if bw is not None else [] ) +
-                  ( [ '%s delay' % delay ] if delay is not None else [] ) +
-                  ( [ '%s jitter' % jitter ] if jitter is not None else [] ) +
-                  ( ['%d%% loss' % loss ] if loss is not None else [] ) +
-                  ( [ 'ECN' ] if enable_ecn else [ 'RED' ]
-                    if enable_red else [] ) )
+        self.current_tc_root = tc_root
+
+        # Display configuration info
+        stuff = []
+        if bw is not None:
+            stuff.append( '%.2fMbit' % bw )
+        if delay is not None:
+            stuff.append( '%s delay' % delay )
+        if jitter is not None:
+            stuff.append( '%s jitter' % jitter )
+        if loss is not None:
+            stuff.append( '%d%% loss' % loss )
+        if enable_ecn:
+            stuff.append( 'ECN' )
+        if enable_red:
+            stuff.append( 'RED' )
         info( '(' + ' '.join( stuff ) + ') ' )
 
         # Execute all the commands in our node
-        debug("at map stage w/cmds: %s\n" % cmds)
-        tcoutputs = [ self.tc(cmd) for cmd in cmds ]
         for output in tcoutputs:
             if output != '':
                 error( "*** Error: %s" % output )
-        debug( "cmds:", cmds, '\n' )
         debug( "outputs:", tcoutputs, '\n' )
-        result[ 'tcoutputs'] = tcoutputs
-        result[ 'parent' ] = parent
+        #result[ 'tcoutputs'] = tcoutputs
 
-        return result
+        #return result
 
 
 class Link( object ):
