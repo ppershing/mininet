@@ -480,7 +480,9 @@ class TCIntf( Intf ):
         tcoutputs = []
         if not self.current_tc_root:
             # Clear existing configuration
-            tcoutputs.append(self.cmd('tc qdisc del dev %s root' % self.name))
+        	tcoutput = self.cmd( 'tc qdisc show dev %s' % self.name )
+        	if "priomap" not in tcoutput:
+            		tcoutputs.append(self.cmd('tc qdisc del dev %s root' % self.name))
 
         for op, node in self.getReconciliationSequence(self.current_tc_root, tc_root):
             cmds = node.getCommands( tc='tc', op=op, dev=self.name )
